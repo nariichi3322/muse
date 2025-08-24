@@ -21,6 +21,7 @@ import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {Setting} from '@prisma/client';
+import {Innertube} from 'youtubei.js';
 
 export enum MediaSource {
   Youtube,
@@ -60,7 +61,31 @@ export interface PlayerEvents {
 
 type YTDLVideoFormat = videoFormat & {loudnessDb?: number};
 
+type YTIFormat = {
+  itag?: number | string;
+  url?: string;
+  deciphered_url?: string;
+  signed_url?: string;
+  signature_cipher?: string;
+  cipher?: string;
+  mime_type?: string;
+  bitrate?: number;
+  average_bitrate?: number;
+  audio_sample_rate?: string | number;
+  audio_channels?: number;
+  isLive?: boolean;
+};
+
 export const DEFAULT_VOLUME = 100;
+
+let ytPromise: Promise<Innertube> | null = null;
+async function getYT(): Promise<Innertube> {
+  if (!ytPromise) {
+    ytPromise = Innertube.create({});
+  }
+
+  return ytPromise;
+}
 
 export default class {
   public voiceConnection: VoiceConnection | null = null;
@@ -508,6 +533,8 @@ export default class {
     let ffmpegInput: string | null;
     const ffmpegInputOptions: string[] = [];
     let shouldCacheVideo = false;
+    let useYTI = false;
+    let loudnessDb;
 
     let format: YTDLVideoFormat | undefined;
 
@@ -515,53 +542,105 @@ export default class {
 
     if (!ffmpegInput) {
       // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
+      const YTDL_info = await ytdl.getInfo(song.url);
+      const YT = await getYT();
+      const YTI_info = await YT.getInfo(song.url);
 
-      const formats = info.formats as YTDLVideoFormat[];
+      const YTDL_formats = YTDL_info.formats as YTDLVideoFormat[];
 
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+      const adaptiveFormats = YTI_info.streaming_data?.adaptive_formats ?? [];
+      const muxedFormats = YTI_info.streaming_data?.formats ?? [];
+      const YTI_formats: YTIFormat[] = [...adaptiveFormats, ...muxedFormats];
 
-      format = formats.find(filter);
+      // Key information
+      debug('title=', YTI_info.basic_info?.title);
+      debug('is_live=', YTI_info.basic_info?.is_live);
+      debug('duration=', YTI_info.basic_info?.duration);
+      debug('has_hls=', Boolean(YTI_info.streaming_data?.hls_manifest_url));
 
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats.length < 1) {
-          return undefined;
-        }
+      const fmt = (f: YTIFormat) => {
+        const mime = f.mime_type;
+        const asr = f.audio_sample_rate;
+        const abr = f.average_bitrate ?? f.bitrate;
+        const url = f.url ?? f.deciphered_url ?? f.signed_url;
+        const cipher = f.signature_cipher ?? f.cipher;
 
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
-
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
-        }
-
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
-            }
-
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
+        return {
+          itag: f.itag,
+          mime,
+          asr,
+          abr,
+          has_url: Boolean(url),
+          has_cipher: Boolean(cipher),
+          url_preview: url ? `${url.slice(0, 80)}...` : undefined,
+        };
       };
 
-      if (!format) {
-        format = nextBestFormat(info.formats);
+      YTI_formats.forEach((f, i) => {
+        debug(`#${i}`, fmt(f));
+      });
+
+      const hls = YTI_info.streaming_data?.hls_manifest_url; // String | undefined
+      const isLive = Boolean(YTI_info.basic_info?.is_live ?? YTI_info.basic_info?.is_upcoming);
+
+      if (isLive && hls) {
+        // HLS stream (use youtubei.js)
+        debug('HLS stream (use youtubei.js)');
+        useYTI = true;
+        ffmpegInput = hls;
+        shouldCacheVideo = false; // No cache for stream
+
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60;
+        const lengthSec = Number(YTI_info.basic_info?.duration ?? 0);
+        // Don't cache livestreams or long videos
+        shouldCacheVideo = !isLive && lengthSec > 0 && lengthSec < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+        loudnessDb = YTI_info.player_config?.audio_config?.loudness_db; // Number | undefined
+      } else {
+        // Normal video (use ytdl-core)
+        debug('Normal video (use ytdl-core)');
+        const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+
+        format = YTDL_formats.find(filter);
+
+        const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
+          if (formats.length < 1) {
+            return undefined;
+          }
+
+          if (formats[0].isLive) {
+            formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
+
+            return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
+          }
+
+          formats = formats
+            .filter(format => format.averageBitrate)
+            .sort((a, b) => {
+              if (a && b) {
+                return b.averageBitrate! - a.averageBitrate!;
+              }
+
+              return 0;
+            });
+          return formats.find(format => !format.bitrate) ?? formats[0];
+        };
 
         if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
+          format = nextBestFormat(YTDL_info.formats);
+
+          if (!format) {
+            // If still no format is found, throw
+            throw new Error('Can\'t find suitable format.');
+          }
         }
+
+        debug('Using format', format);
+        ffmpegInput = format.url;
+
+        // 3) cache
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60;
+        shouldCacheVideo = !YTDL_info.player_response.videoDetails.isLiveContent && parseInt(YTDL_info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
       }
-
-      debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
 
       debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
 
@@ -583,12 +662,19 @@ export default class {
       ffmpegInputOptions.push('-to', options.to.toString());
     }
 
+    let volumeAdjustment;
+    if (useYTI) {
+      volumeAdjustment = (typeof loudnessDb === 'number') ? `${-loudnessDb}dB` : undefined;
+    } else {
+      volumeAdjustment = format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined;
+    }
+
     return this.createReadStream({
       url: ffmpegInput,
       cacheKey: song.url,
       ffmpegInputOptions,
       cache: shouldCacheVideo,
-      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+      volumeAdjustment,
     });
   }
 

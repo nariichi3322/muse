@@ -128,6 +128,7 @@
     "sync-fetch": "^0.3.1",
     "tsx": "3.8.2",
     "xbytes": "^1.7.0",
+    "youtubei.js": "^15.0.1",
     "ytsr": "^3.8.4"
   },
   "resolutions": {
