@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -58,6 +58,7 @@ const GUILD_ID = 'guild-id';
 const VOICE_CHANNEL_ID = 'voice-channel-id';
 
 const makeAudioPlayer = () => ({
+  state: {status: 'playing'},
   listeners: vi.fn(() => []),
   on: vi.fn(),
   pause: vi.fn(),
@@ -322,5 +323,67 @@ describe('stale listener departure events', () => {
     resolveSettings({leaveIfNoListeners: true});
     await event;
     expect(player.disconnect).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('disconnect reason diagnostics', () => {
+  it('records a manual disconnect', () => {
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const player = new Player({} as never, GUILD_ID);
+    player.voiceConnection = makeVoiceConnection() as never;
+    player.disconnect();
+    expect(log).toHaveBeenCalledWith('Playback diagnostic', expect.objectContaining({event: 'disconnect', reason: 'manual-disconnect', guildId: GUILD_ID}));
+  });
+
+  it('records the 30-second queue timeout without an error signal', async () => {
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const player = new Player({} as never, GUILD_ID);
+    player.voiceConnection = makeVoiceConnection() as never;
+    mocks.getGuildSettings.mockResolvedValue({secondsToWaitAfterQueueEmpties: 30});
+    await getPrivateState(player).finishQueue();
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(log).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(log).toHaveBeenCalledWith('Playback diagnostic', expect.objectContaining({event: 'disconnect', reason: 'queue-empty-timeout'}));
+  });
+
+  it.each([false, true])('passes an explicit listener departure reason (missing channel=%s)', async missing => {
+    const {player} = installVoiceEventPlayer();
+    const oldState = makeVoiceEventState(VOICE_CHANNEL_ID, makeMembers(true));
+    const newState = makeVoiceEventState(null, makeMembers(true));
+    if (missing) newState.guild.channels.cache.clear();
+    await handleVoiceStateUpdate(oldState, newState);
+    expect(player.disconnect).toHaveBeenCalledWith(missing ? 'channel-unavailable' : 'no-listeners');
+  });
+});
+
+
+describe('empty-queue timer ownership', () => {
+  it('does not schedule an old settings result after newer playback starts', async () => {
+    const player = new Player({} as never, GUILD_ID); player.voiceConnection = makeVoiceConnection() as never;
+    let resolve!: (settings: object) => void;
+    mocks.getGuildSettings.mockReturnValueOnce(new Promise(done => {resolve = done;}));
+    const old = getPrivateState(player).finishQueue();
+    player.add(makeSong()); Object.assign(player, {getStream: vi.fn().mockResolvedValue(Readable.from([]))});
+    await player.play(); resolve({secondsToWaitAfterQueueEmpties: 30}); await old;
+    expect(getPrivateState(player).disconnectTimer).toBeNull(); expect(player.status).toBe(STATUS.PLAYING);
+  });
+
+  it('does not disconnect a replacement connection after an old settings lookup', async () => {
+    const player = new Player({} as never, GUILD_ID); player.voiceConnection = makeVoiceConnection() as never;
+    let resolve!: (settings: object) => void;
+    mocks.getGuildSettings.mockReturnValueOnce(new Promise(done => {resolve = done;}));
+    const old = getPrivateState(player).finishQueue(); player.disconnect();
+    const replacement = makeVoiceConnection(); player.voiceConnection = replacement as never;
+    resolve({secondsToWaitAfterQueueEmpties: 30}); await old; await vi.advanceTimersByTimeAsync(30_000);
+    expect(replacement.destroy).not.toHaveBeenCalled(); expect(player.voiceConnection).toBe(replacement);
+  });
+
+  it('clears a scheduled queue timeout on explicit disconnect', async () => {
+    const player = new Player({} as never, GUILD_ID); player.voiceConnection = makeVoiceConnection() as never;
+    mocks.getGuildSettings.mockResolvedValue({secondsToWaitAfterQueueEmpties: 30});
+    await getPrivateState(player).finishQueue(); player.disconnect();
+    expect(getPrivateState(player).disconnectTimer).toBeNull(); expect(vi.getTimerCount()).toBe(0);
   });
 });

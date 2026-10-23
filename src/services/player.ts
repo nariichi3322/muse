@@ -36,6 +36,7 @@ import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {getSoundCloudMediaSource, getYouTubeMediaSource, YtDlpMediaUnavailableError} from '../utils/yt-dlp.js';
 import {Setting} from '@prisma/client';
+import {logPlaybackDiagnostic, sanitizePlaybackError, type PlaybackDiagnosticDetails, type PlaybackStopReason} from '../utils/playback-diagnostics.js';
 
 export {DEFAULT_VOLUME, MediaSource, STATUS};
 export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
@@ -44,15 +45,7 @@ const FFMPEG_STARTUP_TIMEOUT_MS = 20_000;
 const VOICE_CONNECTION_ATTEMPTS = 3;
 const VOICE_CONNECTION_ATTEMPT_TIMEOUT_MS = 20_000;
 
-const sanitizeFfmpegError = (error: unknown) => {
-  const detail = error instanceof Error ? error.message : String(error);
-
-  return detail
-    .replace(/https?:\/\/\S+/gi, '[media URL]')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 500);
-};
+const sanitizeFfmpegError = sanitizePlaybackError;
 
 const getMediaIdentifierForLog = (song: QueuedSong) => (
   song.source === MediaSource.Youtube && /^[\w-]{11}$/.test(song.url)
@@ -69,10 +62,14 @@ export class FfmpegMediaUnavailableError extends Error {
 }
 
 export class FfmpegStartupError extends Error {
+  readonly reason: 'http-403' | 'other';
+
   constructor(error: unknown) {
+    const rawDetail = error instanceof Error ? error.message : String(error);
     const detail = sanitizeFfmpegError(error);
     super(`FFmpeg could not initialize audio transcoding${detail ? `: ${detail}` : ''}`);
     this.name = 'FfmpegStartupError';
+    this.reason = /(?:HTTP error|Server returned)\s+403\b|\b403 Forbidden\b/i.test(rawDetail) ? 'http-403' : 'other';
   }
 }
 
@@ -94,6 +91,14 @@ const getFfmpegStartupError = (error: unknown) => {
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
 
+interface PlaybackReadStreamOptions {
+  url: string;
+  cacheKey: string;
+  ffmpegInputOptions?: string[];
+  cache?: boolean;
+  diagnostics?: PlaybackDiagnosticDetails;
+}
+
 export default class {
   public voiceConnection: VoiceConnection | null = null;
   public status = STATUS.PAUSED;
@@ -113,6 +118,9 @@ export default class {
   private currentQueueEntryVersion = 0;
   private nowPlayingQueueEntryVersion: number | null = null;
   private readonly playbackAttempts: PlaybackAttemptTracker<QueuedSong, VoiceConnection>;
+  private pendingPlaybackAttempt?: PlaybackAttemptToken;
+  private recoveringPlaybackAttempt?: PlaybackAttemptToken;
+  private readonly pendingAudioWaits = new Map<PlaybackAttemptToken, AbortController>();
   private readonly programmaticallyStoppedAudioPlayers = new WeakSet<AudioPlayer>();
   private playPositionInterval: NodeJS.Timeout | undefined;
 
@@ -175,10 +183,20 @@ export default class {
     return voiceConnection;
   }
 
-  disconnect(): void {
+  disconnect(reason: PlaybackStopReason = 'manual-disconnect'): void {
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+    }
+
+    if (this.voiceConnection) {
+      logPlaybackDiagnostic('disconnect', {...this.getPlaybackDiagnostics(), reason});
+    }
+
     this.voiceConnectionGeneration++;
     this.pendingConnection = undefined;
-    this.playbackAttempts.invalidate();
+    this.invalidatePlaybackAttempts();
+    this.pendingPlaybackAttempt = undefined;
     this.voiceActivitySessionGeneration++;
 
     if (this.voiceConnection) {
@@ -202,8 +220,20 @@ export default class {
   }
 
   async seek(positionSeconds: number): Promise<void> {
-    const attempt = this.playbackAttempts.begin();
-    await this.seekWithAttempt(positionSeconds, attempt);
+    if (this.getCurrent()?.isLive) {
+      throw new Error('Seeking is not supported for livestreams.');
+    }
+
+    const attempt = this.beginPlaybackAttempt();
+    this.pendingPlaybackAttempt = attempt;
+    try {
+      await this.seekWithAttempt(positionSeconds, attempt);
+    } finally {
+      if (this.pendingPlaybackAttempt === attempt) {
+        this.pendingPlaybackAttempt = undefined;
+        this.recoveringPlaybackAttempt = undefined;
+      }
+    }
   }
 
   async forwardSeek(positionSeconds: number): Promise<void> {
@@ -215,20 +245,37 @@ export default class {
   }
 
   async play(allowAgeRestrictedFallback = true): Promise<void> {
-    const attempt = this.playbackAttempts.begin();
-    await this.playWithAttempt(attempt, allowAgeRestrictedFallback);
+    const attempt = this.beginPlaybackAttempt();
+    this.pendingPlaybackAttempt = attempt;
+    try {
+      await this.playWithAttempt(attempt, allowAgeRestrictedFallback);
+    } finally {
+      if (this.pendingPlaybackAttempt === attempt) {
+        this.pendingPlaybackAttempt = undefined;
+        this.recoveringPlaybackAttempt = undefined;
+      }
+    }
   }
 
   pause(): void {
-    if (this.status !== STATUS.PLAYING) {
+    if (this.status !== STATUS.PLAYING
+      && (!this.pendingPlaybackAttempt || !this.playbackAttempts.isLatest(this.pendingPlaybackAttempt))) {
       throw new Error('Not currently playing.');
     }
 
-    this.playbackAttempts.invalidate();
+    this.invalidatePlaybackAttempts();
     this.status = STATUS.PAUSED;
 
     if (this.audioPlayer) {
-      this.audioPlayer.pause();
+      if (this.audioPlayer.state.status === AudioPlayerStatus.Buffering
+        || this.audioPlayer.state.status === AudioPlayerStatus.Idle) {
+        // Buffering cannot be paused, and an Idle resource cannot be resumed.
+        this.stopAudioPlayer(true);
+        this.audioPlayer = null;
+        this.audioResource = null;
+      } else {
+        this.audioPlayer.pause();
+      }
     }
 
     this.stopTrackingPosition();
@@ -246,7 +293,8 @@ export default class {
     try {
       if (!destinationSong) {
         await this.finishQueue();
-      } else if (this.status !== STATUS.PAUSED) {
+      } else if (this.status !== STATUS.PAUSED
+        || this.isPlaybackStarting()) {
         const playPromise = this.play();
         const destinationConnection = this.voiceConnection;
         if (destinationConnection && destinationSong && destinationQueueEntryVersion !== null) {
@@ -375,7 +423,8 @@ export default class {
     let destinationPlayback: PlayerPlaybackAttemptContext | null = null;
 
     try {
-      if (this.status !== STATUS.PAUSED) {
+      if (this.status !== STATUS.PAUSED
+        || this.isPlaybackStarting()) {
         const playPromise = this.play();
         const destinationConnection = this.voiceConnection;
         if (destinationConnection && destinationSong) {
@@ -532,7 +581,7 @@ export default class {
       this.hasRegisteredVoiceActivityListener = false;
 
       voiceConnection.on('error', error => {
-        console.error(`Voice connection error for guild ${this.guildId}:`, error);
+        console.error(`Voice connection error for guild ${this.guildId}:`, sanitizePlaybackError(error));
       });
 
       const stateTransitions = [voiceConnection.state.status];
@@ -636,46 +685,49 @@ export default class {
 
     const previousPosition = this.positionInSeconds;
     this.stopTrackingPosition();
-    let stream: Readable;
+    let stream: Readable | undefined;
+    let audioPlayer: AudioPlayer | undefined;
     try {
-      stream = await this.getStream(currentSong, {seek: realPositionSeconds, to});
-    } catch (error: unknown) {
-      if (this.playbackAttempts.owns(playback)) {
-        this.positionInSeconds = previousPosition;
-        this.audioPlayer = null;
-        this.audioResource = null;
+      stream = await this.getStream(currentSong, {seek: realPositionSeconds, to}, playback);
+      if (!this.playbackAttempts.owns(playback)) {
+        this.destroyStaleStream(stream);
+        return;
       }
 
+      audioPlayer = this.createPlaybackAudioPlayer(currentSong);
+      this.audioPlayer = audioPlayer;
+      voiceConnection.subscribe(audioPlayer);
+      this.attachListeners();
+      this.playAudioPlayerResource(this.createAudioStream(stream));
+      if (!await this.confirmAudioPlayerPlaying(audioPlayer, playback, stream)) {
+        return;
+      }
+
+      this.startTrackingPosition(currentSong.isLive ? 0 : positionSeconds);
+      this.status = STATUS.PLAYING;
+      this.nowPlaying = currentSong;
+      this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
+    } catch (error: unknown) {
+      this.disposeStaleAudioPlayer(audioPlayer, stream);
+      if (!this.playbackAttempts.owns(playback)) {
+        throw error;
+      }
+
+      this.stopAudioPlayer(true);
+      stream?.destroy();
+      this.positionInSeconds = previousPosition;
+      this.status = STATUS.PAUSED;
+      this.audioPlayer = null;
+      this.audioResource = null;
+      this.recoveringPlaybackAttempt = attempt;
       await this.handlePlaybackError(error, playback, true);
-      return;
     }
-
-    if (!this.playbackAttempts.owns(playback)) {
-      this.destroyStaleStream(stream);
-      return;
-    }
-
-    this.audioPlayer = createAudioPlayer({
-      behaviors: {
-        // Needs to be somewhat high for livestreams
-        maxMissedFrames: 50,
-      },
-    });
-    voiceConnection.subscribe(this.audioPlayer);
-    this.attachListeners();
-    this.playAudioPlayerResource(this.createAudioStream(stream));
-    this.startTrackingPosition(positionSeconds);
-
-    this.status = STATUS.PLAYING;
-    this.nowPlaying = currentSong;
-    this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
   }
 
   private async playWithAttempt(attempt: PlaybackAttemptToken, allowAgeRestrictedFallback: boolean): Promise<void> {
     const currentSong = this.getCurrent();
     const currentQueueEntryVersion = this.getCurrentQueueEntryId();
     const voiceConnection = await this.ensureVoiceConnectionReady();
-
     if (!this.playbackAttempts.isCurrent(attempt, voiceConnection)) {
       return;
     }
@@ -688,82 +740,162 @@ export default class {
       return;
     }
 
-    const playback = this.playbackAttempts.capture(
-      attempt,
-      currentSong,
-      currentQueueEntryVersion,
-      voiceConnection,
-    );
+    const playback = this.playbackAttempts.capture(attempt, currentSong, currentQueueEntryVersion, voiceConnection);
     if (!this.playbackAttempts.owns(playback)) {
       return;
     }
 
-    // Cancel any pending idle disconnection
     if (this.disconnectTimer) {
-      clearInterval(this.disconnectTimer);
+      clearTimeout(this.disconnectTimer);
       this.disconnectTimer = null;
     }
 
-    // Resume from paused state
-    if (this.status === STATUS.PAUSED
+    const resuming = this.status === STATUS.PAUSED
       && currentSong === this.nowPlaying
-      && this.currentQueueEntryVersion === this.nowPlayingQueueEntryVersion) {
-      if (this.audioPlayer) {
-        this.audioPlayer.unpause();
+      && this.currentQueueEntryVersion === this.nowPlayingQueueEntryVersion;
+    const resumableAudioPlayer = resuming && this.audioPlayer
+      && (this.audioPlayer.state.status === AudioPlayerStatus.Paused
+        || this.audioPlayer.state.status === AudioPlayerStatus.Playing)
+      ? this.audioPlayer : undefined;
+    if (resuming && !resumableAudioPlayer && !currentSong.isLive) {
+      return this.seekWithAttempt(this.getPosition(), attempt);
+    }
+
+    const previousPosition = this.positionInSeconds;
+    this.stopTrackingPosition();
+    let stream: Readable | undefined;
+    let audioPlayer: AudioPlayer | undefined;
+    try {
+      if (resumableAudioPlayer) {
+        audioPlayer = resumableAudioPlayer;
+        audioPlayer.unpause();
+        if (!await this.confirmAudioPlayerPlaying(audioPlayer, playback)) {
+          return;
+        }
+
         this.status = STATUS.PLAYING;
         this.startTrackingPosition();
         return;
       }
 
-      // Was disconnected, need to recreate stream
-      if (!currentSong.isLive) {
-        return this.seekWithAttempt(this.getPosition(), attempt);
-      }
-    }
-
-    const previousPosition = this.positionInSeconds;
-    this.stopTrackingPosition();
-    try {
+      this.status = STATUS.PAUSED;
       let positionSeconds: number | undefined;
       let to: number | undefined;
-      if (currentSong.offset !== undefined) {
+      if (!currentSong.isLive && currentSong.offset !== undefined) {
         positionSeconds = currentSong.offset;
         to = currentSong.length + currentSong.offset;
       }
 
-      const stream = await this.getStream(currentSong, {seek: positionSeconds, to});
+      stream = await this.getStream(currentSong, {seek: positionSeconds, to}, playback);
       if (!this.playbackAttempts.owns(playback)) {
         this.destroyStaleStream(stream);
         return;
       }
 
-      this.audioPlayer = createAudioPlayer({
-        behaviors: {
-          // Needs to be somewhat high for livestreams
-          maxMissedFrames: 50,
-        },
-      });
-      voiceConnection.subscribe(this.audioPlayer);
+      audioPlayer = this.createPlaybackAudioPlayer(currentSong);
+      this.audioPlayer = audioPlayer;
+      voiceConnection.subscribe(audioPlayer);
       this.attachListeners();
       this.playAudioPlayerResource(this.createAudioStream(stream));
+      if (!await this.confirmAudioPlayerPlaying(audioPlayer, playback, stream)) {
+        return;
+      }
 
       this.status = STATUS.PLAYING;
       this.nowPlaying = currentSong;
       this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
       this.startTrackingPosition(0);
     } catch (error: unknown) {
-      if (this.playbackAttempts.owns(playback)) {
-        this.positionInSeconds = previousPosition;
-        this.status = STATUS.PAUSED;
-        this.audioPlayer = null;
-        this.audioResource = null;
+      this.disposeStaleAudioPlayer(audioPlayer, stream);
+      if (!this.playbackAttempts.owns(playback)) {
+        throw error;
       }
 
-      await this.handlePlaybackError(
-        error,
-        playback,
-        allowAgeRestrictedFallback,
-      );
+      this.stopAudioPlayer(true);
+      stream?.destroy();
+      this.positionInSeconds = previousPosition;
+      this.status = STATUS.PAUSED;
+      this.audioPlayer = null;
+      this.audioResource = null;
+      this.recoveringPlaybackAttempt = attempt;
+      await this.handlePlaybackError(error, playback, allowAgeRestrictedFallback);
+    }
+  }
+
+  private beginPlaybackAttempt(): PlaybackAttemptToken {
+    this.cancelAudioPlayerWaits();
+    this.recoveringPlaybackAttempt = undefined;
+    return this.playbackAttempts.begin();
+  }
+
+  private invalidatePlaybackAttempts(): void {
+    this.playbackAttempts.invalidate();
+    this.recoveringPlaybackAttempt = undefined;
+    this.cancelAudioPlayerWaits();
+  }
+
+  private cancelAudioPlayerWaits(): void {
+    for (const controller of this.pendingAudioWaits.values()) {
+      controller.abort();
+    }
+
+    this.pendingAudioWaits.clear();
+  }
+
+  private isPlaybackStarting(): boolean {
+    return this.pendingPlaybackAttempt !== undefined
+      && this.playbackAttempts.isLatest(this.pendingPlaybackAttempt)
+      && this.recoveringPlaybackAttempt !== this.pendingPlaybackAttempt;
+  }
+
+  private async waitForAudioPlayerPlaying(audioPlayer: AudioPlayer, controller: AbortController): Promise<void> {
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, 15_000);
+    try {
+      await entersState(audioPlayer, AudioPlayerStatus.Playing, controller.signal);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async confirmAudioPlayerPlaying(audioPlayer: AudioPlayer, playback: PlayerPlaybackAttemptContext, stream?: Readable): Promise<boolean> {
+    this.requirePlaybackOwnership(playback, stream);
+    const controller = new AbortController();
+    this.pendingAudioWaits.set(playback.attempt, controller);
+    try {
+      await this.waitForAudioPlayerPlaying(audioPlayer, controller);
+    } catch (error: unknown) {
+      const cancelled = controller.signal.aborted && error instanceof Error && error.name === 'AbortError';
+      if (!cancelled || this.playbackAttempts.owns(playback)) {
+        throw error;
+      }
+    } finally {
+      if (this.pendingAudioWaits.get(playback.attempt) === controller) {
+        this.pendingAudioWaits.delete(playback.attempt);
+      }
+    }
+
+    if (!this.playbackAttempts.owns(playback)) {
+      this.disposeStaleAudioPlayer(audioPlayer, stream);
+      return false;
+    }
+
+    if (audioPlayer.state.status !== AudioPlayerStatus.Playing) {
+      throw new Error('Audio playback stopped before startup was confirmed.');
+    }
+
+    return true;
+  }
+
+  private disposeStaleAudioPlayer(audioPlayer?: AudioPlayer, stream?: Readable): void {
+    // A newer pause/resume can reuse the same audio player and resource.
+    if (audioPlayer && this.audioPlayer !== audioPlayer) {
+      this.programmaticallyStoppedAudioPlayers.add(audioPlayer);
+      audioPlayer.stop(true);
+      if (stream) {
+        this.destroyStaleStream(stream);
+      }
     }
   }
 
@@ -797,7 +929,7 @@ export default class {
     if (error instanceof YtDlpMediaUnavailableError
       || error instanceof FfmpegMediaUnavailableError
       || isGone) {
-      const detail = error instanceof Error ? error.message : 'media returned HTTP 410';
+      const detail = sanitizePlaybackError(error instanceof Error ? error : 'media returned HTTP 410');
       console.warn(`Skipping unplayable track for guild ${this.guildId} (${getMediaIdentifierForLog(playback.song)}): ${detail}`);
       await this.advancePastUnplayableTrack();
       return;
@@ -810,76 +942,136 @@ export default class {
     return hasha(url);
   }
 
-  private async getStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
-    if (this.status === STATUS.PLAYING) {
-      this.stopAudioPlayer();
-    } else if (this.status === STATUS.PAUSED) {
-      this.stopAudioPlayer(true);
-    }
+  private createPlaybackAudioPlayer(song: QueuedSong): AudioPlayer {
+    return createAudioPlayer({behaviors: {maxMissedFrames: song.isLive ? 500 : 50}});
+  }
 
-    if (song.source === MediaSource.HLS) {
-      return this.createReadStream({url: song.url, cacheKey: song.url});
-    }
-
-    let ffmpegInput: string | null;
-    const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
-
-    // Cached audio starts at zero but may end at a chapter or SponsorBlock boundary.
-    // Version the key to avoid reusing legacy URL-only entries with unknown bounds.
-    const cacheKey = JSON.stringify(['audio-v2', song.source, song.url, options.to ?? null]);
-    const cacheHash = this.getHashForCache(cacheKey);
-    const cachedEntry = await this.fileCache.getEntryFor(cacheHash);
-    ffmpegInput = cachedEntry?.path ?? null;
-
-    if (!ffmpegInput) {
-      const mediaSource = await (song.source === MediaSource.SoundCloud
-        ? getSoundCloudMediaSource(song.url)
-        : getYouTubeMediaSource(song.url));
-      ffmpegInput = mediaSource.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
-
-      const headerOptions = this.buildFfmpegHeaderOptions(mediaSource.headers);
-      ffmpegInputOptions.push(...headerOptions);
-    }
-
-    if (options.seek) {
-      ffmpegInputOptions.push('-ss', options.seek.toString());
-    }
-
-    if (options.to) {
-      ffmpegInputOptions.push('-to', options.to.toString());
-    }
-
-    try {
-      return await this.createReadStream({
-        url: ffmpegInput,
-        cacheKey,
-        ffmpegInputOptions,
-        cache: shouldCacheVideo,
-      });
-    } catch (error: unknown) {
-      if (cachedEntry
-        && error instanceof FfmpegMediaUnavailableError
-        && error.reason === 'invalid-output') {
-        await this.fileCache.invalidate(cacheHash, cachedEntry.generation);
-        return this.getStream(song, options);
+  private requirePlaybackOwnership(playback: PlayerPlaybackAttemptContext, stream?: Readable): void {
+    if (!this.playbackAttempts.owns(playback)) {
+      if (stream) {
+        this.destroyStaleStream(stream);
       }
 
+      throw new Error('Playback attempt was cancelled.');
+    }
+  }
+
+  private async createOwnedReadStream(options: PlaybackReadStreamOptions, playback: PlayerPlaybackAttemptContext): Promise<Readable> {
+    this.requirePlaybackOwnership(playback);
+    try {
+      const stream = await this.createReadStream(options);
+      this.requirePlaybackOwnership(playback, stream);
+      return stream;
+    } catch (error: unknown) {
+      this.requirePlaybackOwnership(playback);
+      throw error;
+    }
+  }
+
+  private async getStream(song: QueuedSong, options: {seek?: number; to?: number}, playback: PlayerPlaybackAttemptContext): Promise<Readable> {
+    try {
+      this.requirePlaybackOwnership(playback);
+      if (this.status === STATUS.PLAYING) {
+        this.stopAudioPlayer();
+      } else if (this.status === STATUS.PAUSED) {
+        this.stopAudioPlayer(true);
+      }
+
+      const diagnostics = this.getPlaybackDiagnostics(song);
+      if (song.source === MediaSource.HLS) {
+        return await this.createOwnedReadStream({url: song.url, cacheKey: song.url, diagnostics}, playback);
+      }
+
+      let ffmpegInput: string | null;
+      const ffmpegInputOptions: string[] = [];
+      let shouldCacheVideo = false;
+      // Cached audio begins at zero, with a generation-specific chapter/end boundary.
+      const cacheKey = JSON.stringify(['audio-v2', song.source, song.url, options.to ?? null]);
+      const cacheHash = this.getHashForCache(cacheKey);
+      const cachedEntry = song.isLive ? undefined : await this.fileCache.getEntryFor(cacheHash);
+      this.requirePlaybackOwnership(playback);
+      ffmpegInput = cachedEntry?.path ?? null;
+
+      if (!ffmpegInput) {
+        this.requirePlaybackOwnership(playback);
+        const mediaSource = await (song.source === MediaSource.SoundCloud
+          ? getSoundCloudMediaSource(song.url)
+          : getYouTubeMediaSource(song.url));
+        this.requirePlaybackOwnership(playback);
+        if (mediaSource.isLive) {
+          song.isLive = true;
+          diagnostics.isLive = true;
+        }
+
+        ffmpegInput = mediaSource.url;
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60;
+        shouldCacheVideo = !song.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+        debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+        ffmpegInputOptions.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+        ffmpegInputOptions.push(...this.buildFfmpegHeaderOptions(mediaSource.headers));
+      }
+
+      if (!song.isLive && options.seek) {
+        ffmpegInputOptions.push('-ss', options.seek.toString());
+      }
+
+      if (!song.isLive && options.to) {
+        ffmpegInputOptions.push('-to', options.to.toString());
+      }
+
+      try {
+        return await this.createOwnedReadStream({
+          url: ffmpegInput, cacheKey, ffmpegInputOptions, cache: shouldCacheVideo, diagnostics,
+        }, playback);
+      } catch (error: unknown) {
+        this.requirePlaybackOwnership(playback);
+        if (cachedEntry && error instanceof FfmpegMediaUnavailableError && error.reason === 'invalid-output') {
+          await this.fileCache.invalidate(cacheHash, cachedEntry.generation);
+          this.requirePlaybackOwnership(playback);
+          return this.getStream(song, options, playback);
+        }
+
+        if (!cachedEntry && song.source === MediaSource.Youtube
+          && error instanceof FfmpegStartupError && error.reason === 'http-403') {
+          logPlaybackDiagnostic('ffmpeg-error', {...diagnostics, reason: 'http-403-retry', error});
+          this.requirePlaybackOwnership(playback);
+          const fallback = await getYouTubeMediaSource(song.url, {playerClient: 'android'});
+          this.requirePlaybackOwnership(playback);
+          if (fallback.isLive) {
+            song.isLive = true;
+          }
+
+          const fallbackInputOptions = [
+            '-reconnect',
+            '1',
+            '-reconnect_streamed',
+            '1',
+            '-reconnect_delay_max',
+            '5',
+            ...this.buildFfmpegHeaderOptions(fallback.headers),
+          ];
+          if (!song.isLive && options.seek) {
+            fallbackInputOptions.push('-ss', options.seek.toString());
+          }
+
+          if (!song.isLive && options.to) {
+            fallbackInputOptions.push('-to', options.to.toString());
+          }
+
+          // A second startup failure exits this catch; there is no third launch.
+          return await this.createOwnedReadStream({
+            url: fallback.url,
+            cacheKey,
+            ffmpegInputOptions: fallbackInputOptions,
+            cache: !song.isLive && song.length < 30 * 60 && !options.seek,
+            diagnostics: {...diagnostics, isLive: song.isLive, reason: 'http-403-android-fallback'},
+          }, playback);
+        }
+
+        throw error;
+      }
+    } catch (error: unknown) {
+      this.requirePlaybackOwnership(playback);
       throw error;
     }
   }
@@ -933,7 +1125,7 @@ export default class {
         }
 
         void this.onAudioPlayerIdle(oldState, newState).catch(error => {
-          console.error(`Audio player idle handler failed for guild ${this.guildId}:`, error);
+          console.error(`Audio player idle handler failed for guild ${this.guildId}:`, sanitizeFfmpegError(error));
         });
       });
     }
@@ -944,7 +1136,7 @@ export default class {
       isCurrent: candidate => this.voiceConnection === candidate,
       dispose: candidate => {
         if (this.voiceConnection === candidate) {
-          this.disconnect();
+          this.disconnect('voice-recovery-exhausted');
         } else {
           destroyVoiceConnection(candidate);
         }
@@ -1011,9 +1203,11 @@ export default class {
       queueEntryVersion,
       connection,
     );
-    console.warn(`Trying audio fallback for age-restricted YouTube track in guild ${this.guildId}: ${song.url} -> ${replacement.url}`);
+    console.warn(`Trying audio fallback for age-restricted YouTube track in guild ${this.guildId}: ${getMediaIdentifierForLog(song)} -> ${getMediaIdentifierForLog(replacement)}`);
 
     try {
+      this.pendingPlaybackAttempt = attempt;
+      this.recoveringPlaybackAttempt = undefined;
       await this.playWithAttempt(attempt, false);
       return true;
     } catch (error: unknown) {
@@ -1027,14 +1221,20 @@ export default class {
   }
 
   private async onAudioPlayerIdle(_oldState: AudioPlayerState, newState: AudioPlayerState): Promise<void> {
+    if (newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
+      logPlaybackDiagnostic('audio-idle', {...this.getPlaybackDiagnostics(), audioState: newState.status});
+    }
+
     // Automatically advance queued song at end
-    if (this.loopCurrentSong && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
+    if (this.loopCurrentSong && !this.getCurrent()?.isLive
+      && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
       await this.seek(0);
       return;
     }
 
     // Automatically re-add current song to queue
-    if (this.loopCurrentQueue && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
+    if (this.loopCurrentQueue && !this.getCurrent()?.isLive
+      && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
       const currentSong = this.getCurrent();
 
       if (currentSong) {
@@ -1068,23 +1268,51 @@ export default class {
   }
 
   private async finishQueue(): Promise<void> {
-    this.playbackAttempts.invalidate();
+    this.invalidatePlaybackAttempts();
+    const attempt = this.playbackAttempts.latest();
+    const {voiceConnection} = this;
+    const ownsIdle = () => this.playbackAttempts.isLatest(attempt)
+      && this.voiceConnection === voiceConnection && this.status === STATUS.IDLE;
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+    }
+
     this.stopTrackingPosition();
     this.status = STATUS.IDLE;
     this.stopAudioPlayer(true);
-
     const settings = await getGuildSettings(this.guildId);
+    if (!ownsIdle()) {
+      return;
+    }
 
     const {secondsToWaitAfterQueueEmpties} = settings;
     if (secondsToWaitAfterQueueEmpties !== 0) {
-      this.disconnectTimer = setTimeout(() => {
-        // Make sure we are not accidentally playing
-        // when disconnecting
-        if (this.status === STATUS.IDLE) {
-          this.disconnect();
+      const timer = setTimeout(() => {
+        if (this.disconnectTimer !== timer) {
+          return;
+        }
+
+        this.disconnectTimer = null;
+        if (ownsIdle()) {
+          this.disconnect('queue-empty-timeout');
         }
       }, secondsToWaitAfterQueueEmpties * 1000);
+      this.disconnectTimer = timer;
     }
+  }
+
+  private getPlaybackDiagnostics(song = this.getCurrent()): PlaybackDiagnosticDetails {
+    return {
+      guildId: this.guildId,
+      queueEntryId: song === this.getCurrent() ? this.getCurrentQueueEntryId() ?? undefined : undefined,
+      mediaId: song ? (song.source === MediaSource.Youtube && /^[\w-]{11}$/.test(song.url) ? song.url : hasha(song.url).slice(0, 16)) : undefined,
+      isLive: song?.isLive,
+      positionSeconds: this.positionInSeconds,
+      resourcePlaybackDurationMs: this.audioResource?.playbackDuration,
+      audioState: this.audioPlayer?.state?.status,
+      voiceState: this.voiceConnection?.state.status,
+    };
   }
 
   private buildFfmpegHeaderOptions(headers: Record<string, string>) {
@@ -1099,7 +1327,18 @@ export default class {
     return ['-headers', `${headerLines}\r\n`];
   }
 
-  private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean}): Promise<Readable> {
+  private async createReadStream(options: PlaybackReadStreamOptions): Promise<Readable> {
+    const diagnostics = options.diagnostics ?? this.getPlaybackDiagnostics();
+    const logFfmpeg = (event: 'ffmpeg-end' | 'ffmpeg-error', error?: unknown) => {
+      const current = diagnostics.queueEntryId !== undefined && diagnostics.queueEntryId === this.getCurrentQueueEntryId();
+      logPlaybackDiagnostic(event, {
+        ...diagnostics,
+        positionSeconds: current ? this.positionInSeconds : diagnostics.positionSeconds,
+        resourcePlaybackDurationMs: current ? this.audioResource?.playbackDuration : undefined,
+        error,
+      });
+    };
+
     return new Promise((resolve, reject) => {
       const capacitor = new WriteStream();
       const startupProbeStream = capacitor.createReadStream();
@@ -1191,6 +1430,7 @@ export default class {
       };
 
       const onFfmpegEnd = () => {
+        logFfmpeg('ffmpeg-end');
         ffmpegEnded = true;
         finalizeCacheWriteIfComplete();
         if (startupProbeStream.readableEnded) {
@@ -1225,6 +1465,7 @@ export default class {
             return;
           }
 
+          logFfmpeg('ffmpeg-error', error);
           if (!startupSettled) {
             rejectStartup(getFfmpegStartupError(error));
             return;
@@ -1269,11 +1510,10 @@ export default class {
       stream.pipe(capacitor);
 
       returnedStream.on('close', () => {
+        hasReturnedStreamClosed = true;
         if (!options.cache) {
           stream.kill('SIGKILL');
         }
-
-        hasReturnedStreamClosed = true;
       });
     });
   }

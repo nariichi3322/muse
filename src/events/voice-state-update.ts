@@ -31,6 +31,6 @@ export default async (oldState: VoiceState, newState: VoiceState): Promise<void>
 
   const voiceChannel = newState.guild.channels.cache.get(channelId) as VoiceChannel | undefined;
   if (!voiceChannel || (getSizeWithoutBots(voiceChannel) === 0 && leaveIfNoListeners)) {
-    player.disconnect();
+    player.disconnect(voiceChannel ? 'no-listeners' : 'channel-unavailable');
   }
 };

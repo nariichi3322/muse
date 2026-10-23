@@ -32,7 +32,7 @@ vi.mock('execa', () => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -83,6 +83,7 @@ type FakeAudioPlayer = ReturnType<typeof makeAudioPlayer>;
 const makeAudioPlayer = () => {
   const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
   const audioPlayer = {
+    state: {status: 'playing'},
     emit: (event: string, ...args: unknown[]) => {
       for (const handler of handlers.get(event) ?? []) {
         handler(...args);
@@ -210,7 +211,7 @@ beforeEach(() => {
     volume: {setVolume: vi.fn()},
   }));
   dependencyMocks.entersState.mockResolvedValue(undefined);
-  dependencyMocks.execa.mockResolvedValue({stdout: VALID_MEDIA_RESPONSE});
+  dependencyMocks.execa.mockReset().mockResolvedValue({stdout: VALID_MEDIA_RESPONSE});
   dependencyMocks.getGuildSettings.mockResolvedValue({
     playlistLimit: 50,
     queueAddResponseEphemeral: false,
@@ -773,7 +774,7 @@ describe('CTRL-20 audio-idle advance preservation', () => {
     expect(player.getPosition()).toBe(0);
     expect(player.status).toBe(STATUS.PLAYING);
     expect(getStream).toHaveBeenCalledTimes(2);
-    expect(getStream).toHaveBeenLastCalledWith(repeated, {seek: 0, to: 100});
+    expect(getStream).toHaveBeenLastCalledWith(repeated, {seek: 0, to: 100}, expect.objectContaining({song: repeated}));
   });
 
   it('re-adds each naturally completed entry so queue loop cycles in order', async () => {
@@ -821,8 +822,26 @@ describe('CTRL-20 audio-idle advance preservation', () => {
 
     await expect(logged).resolves.toEqual([
       `Audio player idle handler failed for guild ${GUILD_ID}:`,
-      idleError,
+      'natural advance failed',
     ]);
     expect(consoleError).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe('live idle diagnostic', () => {
+  it('records unknown Idle with media identity and playback position', async () => {
+    vi.useFakeTimers();
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const {player} = makeReadyPlayer();
+    player.add({...makeQueuedSong('Live'), url: 'abcdefghijk', isLive: true});
+    await player.play();
+    await vi.advanceTimersByTimeAsync(2_000);
+    getPrivatePlayer(player).audioPlayer!.emit('idle', {status: 'playing'}, {status: 'idle'});
+    await flushAsyncWork();
+    expect(log).toHaveBeenCalledWith('Playback diagnostic', expect.objectContaining({event: 'audio-idle', isLive: true, mediaId: 'abcdefghijk', reason: 'unknown', positionSeconds: 2}));
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 });

@@ -30,3 +30,8 @@ updates:
   - dependency-name: "@discordjs/opus"
     versions:
     - 0.4.0
+- package-ecosystem: docker
+  directory: "/"
+  schedule:
+    interval: daily
+    time: "10:00"

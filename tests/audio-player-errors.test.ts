@@ -27,6 +27,7 @@ const makePlayer = () => {
     source: MediaSource.Youtube, isLive: false, playlist: null, thumbnailUrl: null,
     addedInChannelId: 'text-id', requestedBy: 'user-id'});
   const input = new PassThrough();
+  input.write(Buffer.from([0xf8, 0xff, 0xfe]));
   Object.assign(player, {
     getStream: vi.fn(async () => input),
     createAudioStream: () => createAudioResource(input, {inputType: StreamType.Opus}),

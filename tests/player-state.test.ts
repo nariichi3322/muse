@@ -10,7 +10,7 @@ const dependencyMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -77,6 +77,7 @@ const makeSong = (title: string, overrides: Partial<QueuedSong> = {}): QueuedSon
 });
 
 const makeAudioPlayer = () => ({
+  state: {status: 'playing'},
   listeners: vi.fn(() => []),
   on: vi.fn(),
   pause: vi.fn(),
@@ -196,7 +197,7 @@ describe('Player forward state transitions', () => {
     getStream.mockResolvedValueOnce(Readable.from([]));
     await player.play();
 
-    expect(getStream).toHaveBeenLastCalledWith(song, {seek: 12, to: 100});
+    expect(getStream).toHaveBeenLastCalledWith(song, {seek: 12, to: 100}, expect.objectContaining({song: song}));
     expect(player.status).toBe(STATUS.PLAYING);
     expect(getPrivateState(player).audioPlayer).not.toBeNull();
   });
@@ -495,7 +496,7 @@ describe('Player same-URL entry identity', () => {
     expect(getStream).toHaveBeenLastCalledWith(nextSong, {
       seek: nextSong.offset,
       to: nextSong.offset + nextSong.length,
-    });
+    }, expect.objectContaining({song: nextSong}));
   });
 
   it('recreates a disconnected same-entry stream at its retained position', async () => {
@@ -512,7 +513,7 @@ describe('Player same-URL entry identity', () => {
 
     expect(player.getCurrent()).toBe(song);
     expect(player.getPosition()).toBe(7);
-    expect(getStream).toHaveBeenLastCalledWith(song, {seek: 7, to: 100});
+    expect(getStream).toHaveBeenLastCalledWith(song, {seek: 7, to: 100}, expect.objectContaining({song: song}));
   });
 
   it('treats the same song object queued twice as two different entries', async () => {
@@ -770,5 +771,135 @@ describe('progress marker bounds', () => {
     expect(characters.filter(character => character === '🔘')).toHaveLength(1);
     expect(progressBar.startsWith('🔘')).toBe(startsWithMarker);
     expect(progressBar.endsWith('🔘')).toBe(endsWithMarker);
+  });
+});
+
+
+describe('live seek rejection', () => {
+  it('rejects a known live seek without pausing the current playback', async () => {
+    const {player, getStream} = makeReadyPlayer();
+    player.add(makeSong('Live', {isLive: true, length: 1200}));
+    await player.play();
+    await expect(player.seek(20)).rejects.toThrow('Seeking is not supported for livestreams.');
+    expect(player.status).toBe(STATUS.PLAYING);
+    expect(getStream).toHaveBeenCalledOnce();
+    expect(dependencyMocks.createAudioPlayer).toHaveBeenCalledWith({behaviors: {maxMissedFrames: 500}});
+  });
+});
+
+
+describe('confirmed Playing and wait ownership', () => {
+  const flush = async () => {for (let i = 0; i < 40; i++) await Promise.resolve();};
+  const holdPlaying = () => {
+    const gate = makeDeferred<void>();
+    void gate.promise.catch(() => {});
+    dependencyMocks.entersState.mockImplementation((_target: object, state: string) => state === 'playing' ? gate.promise : Promise.resolve());
+    return gate;
+  };
+
+  it.each(['initial','seek','resume'])('keeps %s pending and position frozen until Playing', async phase => {
+    const {player} = makeReadyPlayer();
+    player.add(makeSong('A'));
+    if (phase !== 'initial') {await player.play(); await vi.advanceTimersByTimeAsync(3_000);}
+    if (phase === 'resume') player.pause();
+    const position = player.getPosition();
+    const gate = holdPlaying();
+    const pending = phase === 'seek' ? player.seek(12) : player.play();
+    await flush();
+    expect(dependencyMocks.entersState).toHaveBeenCalledWith(getPrivateState(player).audioPlayer, 'playing', expect.any(AbortSignal));
+    expect(player.status).toBe(STATUS.PAUSED);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(player.getPosition()).toBe(position);
+    gate.resolve(undefined); await pending;
+    expect(player.status).toBe(STATUS.PLAYING);
+    expect(player.getPosition()).toBe(phase === 'seek' ? 12 : position);
+  });
+
+  it.each(['initial','seek','resume'])('cleans an owned %s timeout and permits retry', async phase => {
+    const {player} = makeReadyPlayer(); player.add(makeSong('A'));
+    if (phase !== 'initial') {await player.play(); await vi.advanceTimersByTimeAsync(3_000);}
+    if (phase === 'resume') player.pause();
+    const position = player.getPosition(); const gate = holdPlaying();
+    const pending = phase === 'seek' ? player.seek(12) : player.play();
+    const rejection = expect(pending).rejects.toThrow('Playing timeout');
+    void rejection.catch(() => {});
+    await flush(); gate.reject(new Error('Playing timeout')); await rejection;
+    expect(player.status).toBe(STATUS.PAUSED);
+    expect(player.getPosition()).toBe(position);
+    expect(getPrivateState(player).audioPlayer).toBeNull();
+    expect(getPrivateState(player).audioResource).toBeNull();
+    dependencyMocks.entersState.mockResolvedValue(undefined);
+    await player.play(); expect(player.status).toBe(STATUS.PLAYING);
+  });
+
+  it.each([false,true])('does not mutate B when A wait settles (reject=%s)', async reject => {
+    const {player,getStream} = makeReadyPlayer();
+    const first = makeTrackedStream(); const second = makeTrackedStream();
+    getStream.mockResolvedValueOnce(first.stream).mockResolvedValueOnce(second.stream);
+    player.add(makeSong('A')); player.add(makeSong('B'));
+    const gate = holdPlaying(); const old = player.play(); void old.catch(() => {});
+    await flush(); const oldAudio = getPrivateState(player).audioPlayer;
+    player.manualForward(1); dependencyMocks.entersState.mockResolvedValue(undefined);
+    await player.play(); await vi.advanceTimersByTimeAsync(1_000);
+    const audio = getPrivateState(player).audioPlayer; const resource = getPrivateState(player).audioResource;
+    const handleError = vi.spyOn(player as any, 'handlePlaybackError');
+    if (reject) {gate.reject(new Error('stale wait failure')); await expect(old).rejects.toThrow('stale wait failure');}
+    else {gate.resolve(undefined); await old;}
+    expect(player.getCurrent()?.title).toBe('B'); expect(player.status).toBe(STATUS.PLAYING); expect(player.getPosition()).toBe(1);
+    expect(getPrivateState(player).audioPlayer).toBe(audio); expect(getPrivateState(player).audioResource).toBe(resource);
+    expect(second.stream.destroyed).toBe(false); expect(first.stream.destroyed).toBe(true);
+    expect(oldAudio?.stop).toHaveBeenCalled(); expect(handleError).not.toHaveBeenCalled();
+  });
+
+  it.each([false,true])('preserves a newer resume on the same audio player (reject=%s)', async reject => {
+    const {player,getStream} = makeReadyPlayer(); player.add(makeSong('A'));
+    await player.play(); player.pause();
+    const audio = getPrivateState(player).audioPlayer;
+    const gate = holdPlaying(); const old = player.play(); void old.catch(() => {}); await flush();
+    player.pause(); dependencyMocks.entersState.mockResolvedValue(undefined); await player.play();
+    if (reject) {gate.reject(new Error('old resume timeout')); await expect(old).rejects.toThrow('old resume timeout');}
+    else {gate.resolve(undefined); await old;}
+    expect(getPrivateState(player).audioPlayer).toBe(audio); expect(player.status).toBe(STATUS.PLAYING);
+    expect(audio?.stop).not.toHaveBeenCalled(); expect(getStream).toHaveBeenCalledOnce();
+  });
+
+  it('allows pause to cancel initial extraction without starting an audio player', async () => {
+    const {player,getStream} = makeReadyPlayer(); player.add(makeSong('A'));
+    const extraction = makeDeferred<Readable>(); getStream.mockReturnValueOnce(extraction.promise);
+    const pending = player.play(); await flush();
+    expect(() => player.pause()).not.toThrow();
+    const {stream} = makeTrackedStream(); extraction.resolve(stream); await pending;
+    expect(stream.destroyed).toBe(true); expect(dependencyMocks.createAudioPlayer).not.toHaveBeenCalled(); expect(player.status).toBe(STATUS.PAUSED);
+  });
+
+  it('keeps a pause during initial Playing wait paused after late success', async () => {
+    const {player} = makeReadyPlayer(); player.add(makeSong('A'));
+    const gate = holdPlaying(); const pending = player.play(); await flush();
+    player.pause(); gate.resolve(undefined); await pending;
+    expect(player.status).toBe(STATUS.PAUSED); expect(player.getPosition()).toBe(0);
+  });
+
+  it.each([false,true])('keeps disconnect final after a pending wait (reject=%s)', async reject => {
+    const {player,getStream} = makeReadyPlayer(); player.add(makeSong('A'));
+    const {stream} = makeTrackedStream(); getStream.mockResolvedValueOnce(stream);
+    const gate = holdPlaying(); const old = player.play(); void old.catch(() => {}); await flush();
+    player.disconnect();
+    if (reject) {gate.reject(new Error('old disconnected wait')); await expect(old).rejects.toThrow('old disconnected wait');}
+    else {gate.resolve(undefined); await old;}
+    expect(player.voiceConnection).toBeNull(); expect(getPrivateState(player).audioPlayer).toBeNull(); expect(stream.destroyed).toBe(true); expect(player.status).toBe(STATUS.PAUSED);
+  });
+});
+
+
+describe('back while playback is starting', () => {
+  it('starts the newer back destination while an older stream is still pending', async () => {
+    const {player,getStream} = makeReadyPlayer();
+    player.add(makeSong('A')); player.add(makeSong('B')); player.add(makeSong('C'));
+    player.manualForward(2); await player.play();
+    const entered = makeDeferred<void>(); const slow = makeDeferred<Readable>();
+    getStream.mockImplementationOnce(() => {entered.resolve(undefined); return slow.promise;});
+    const old = player.back(); await entered.promise;
+    await player.back(); const stale = makeTrackedStream(); slow.resolve(stale.stream); await old;
+    expect(player.getCurrent()?.title).toBe('A'); expect(player.status).toBe(STATUS.PLAYING); expect(stale.stream.destroyed).toBe(true);
   });
 });

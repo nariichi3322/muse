@@ -9,7 +9,7 @@
   "types": "dts/types",
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=24.22.1 <25"
   },
   "files": [
     "src"
@@ -58,6 +58,7 @@
     "vitest": "4.1.10"
   },
   "eslintConfig": {
+    "root": true,
     "extends": [
       "xo",
       "xo-typescript/space"

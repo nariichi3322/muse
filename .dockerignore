@@ -4,3 +4,7 @@ dist
 dts
 .env
 Dockerfile
+
+.git
+.worktrees
+.superpowers

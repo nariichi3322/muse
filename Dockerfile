@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS base
+FROM node:24.22.1-trixie-slim AS base
 
 ARG YT_DLP_VERSION=
 ENV MUSE_BUNDLED_YT_DLP_PATH=/opt/yt-dlp/bin/yt-dlp
@@ -42,10 +42,10 @@ RUN apt-get update \
 COPY package.json .
 COPY yarn.lock .
 
-RUN yarn install --prod
+RUN yarn install --prod --frozen-lockfile
 RUN cp -R node_modules /usr/app/prod_node_modules
 
-RUN yarn install
+RUN yarn install --frozen-lockfile
 
 FROM dependencies AS builder
 

@@ -308,40 +308,67 @@ export const updateYtDlp = async (): Promise<YtDlpUpdateResult> => {
   };
 };
 
-const extractMedia = async (url: string, playlistLimit?: number, useYouTubeCookies = true): Promise<YtDlpResponse & SoundCloudMetadata> => {
+const extractMedia = async (
+  url: string,
+  playlistLimit?: number,
+  useYouTubeCookies = true,
+  {playerClient: preferredPlayerClient}: {playerClient?: string} = {},
+): Promise<YtDlpResponse & SoundCloudMetadata> => {
   try {
     return await withTemporaryCookies(async cookiesPath => {
-      const args = [
-        '--dump-single-json',
-        ...(playlistLimit === undefined ? ['--no-playlist'] : ['--flat-playlist', '--playlist-end', String(playlistLimit)]),
-        '--skip-download',
-        '--no-warnings',
-        '--no-cache-dir',
-        '--js-runtimes',
-        'node',
-        '-f',
-        'bestaudio/best',
-        '-S',
-        'proto:https',
-      ];
+      const execute = (useJsRuntime: boolean, playerClient?: string) => {
+        const args = [
+          '--dump-single-json',
+          ...(playlistLimit === undefined ? ['--no-playlist'] : ['--flat-playlist', '--playlist-end', String(playlistLimit)]),
+          '--skip-download',
+          '--no-warnings',
+          '--no-cache-dir',
+          ...(useJsRuntime ? ['--js-runtimes', 'node'] : []),
+          ...(playerClient ? ['--extractor-args', `youtube:player_client=${playerClient}`] : []),
+          '-f',
+          'bestaudio/best',
+          '-S',
+          'proto:https',
+          ...(cookiesPath && !playerClient ? ['--cookies', cookiesPath] : []),
+          url,
+        ];
+        return execa(getExecutable(), args, {timeout: YT_DLP_EXTRACT_TIMEOUT_MS});
+      };
 
-      if (cookiesPath) {
-        args.push('--cookies', cookiesPath);
+      const extract = async (playerClient?: string) => {
+        try {
+          return await execute(true, playerClient);
+        } catch (error: unknown) {
+          if (!useYouTubeCookies || !/no such option:\s*--js-runtimes\b/i.test(getExecaErrorMessage(error))) {
+            throw error;
+          }
+
+          return execute(false, playerClient ?? 'android');
+        }
+      };
+
+      let stdout = '';
+      const attempts = useYouTubeCookies ? 3 : 1;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const playerClient = preferredPlayerClient ?? (attempt === 1 ? undefined : 'android');
+          // Wait for process exit before starting another extraction.
+          // eslint-disable-next-line no-await-in-loop
+          ({stdout} = await extract(playerClient));
+          break;
+        } catch (error: unknown) {
+          if (attempt === attempts || !/the page needs to be reloaded/i.test(getExecaErrorMessage(error))) {
+            throw error;
+          }
+        }
       }
 
-      args.push(url);
-
-      const {stdout} = await execa(getExecutable(), args, {
-        timeout: YT_DLP_EXTRACT_TIMEOUT_MS,
-      });
-
       return JSON.parse(stdout) as YtDlpResponse & SoundCloudMetadata;
-    }, useYouTubeCookies);
+    }, useYouTubeCookies && !preferredPlayerClient);
   } catch (error: unknown) {
     if (isExecaError(error)) {
       const detail = error.stderr?.trim() ?? error.shortMessage ?? 'Unknown yt-dlp error';
       const extractionError = `yt-dlp failed to extract media: ${detail}`;
-
       const unavailableReason = getMediaUnavailableReason(detail);
       if (unavailableReason) {
         throw new YtDlpMediaUnavailableError(extractionError, unavailableReason);
@@ -372,8 +399,8 @@ const toMediaSource = (response: YtDlpResponse): YtDlpMediaSource => {
   };
 };
 
-export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlpMediaSource> => (
-  toMediaSource(await extractMedia(toYouTubeWatchUrl(videoIdOrUrl)))
+export const getYouTubeMediaSource = async (videoIdOrUrl: string, options?: {playerClient?: string}): Promise<YtDlpMediaSource> => (
+  toMediaSource(await extractMedia(toYouTubeWatchUrl(videoIdOrUrl), undefined, true, options))
 );
 
 export const getSoundCloudMetadata = async (url: string, playlistLimit: number): Promise<SoundCloudMetadata> => (
