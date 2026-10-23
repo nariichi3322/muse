@@ -6,6 +6,7 @@ import path from 'path';
 const YT_DLP_VERSION_TIMEOUT_MS = 15_000;
 const YT_DLP_UPDATE_TIMEOUT_MS = 120_000;
 const YT_DLP_EXTRACT_TIMEOUT_MS = 45_000;
+const YT_DLP_EXTRACT_ATTEMPTS = 3;
 
 interface YtDlpMediaDownload {
   readonly url?: string;
@@ -121,6 +122,43 @@ const isExecaError = (error: unknown): error is {stderr?: string; shortMessage?:
 const toYouTubeWatchUrl = (videoIdOrUrl: string) => videoIdOrUrl.length === 11
   ? `https://www.youtube.com/watch?v=${videoIdOrUrl}`
   : videoIdOrUrl;
+
+const isUnsupportedJsRuntimesOption = (error: unknown) => isExecaError(error)
+  && /no such option:\s*--js-runtimes\b/i.test(error.stderr ?? error.shortMessage ?? '');
+
+const isTransientExtractionError = (error: unknown) => isExecaError(error)
+  && /the page needs to be reloaded/i.test(error.stderr ?? error.shortMessage ?? '');
+
+const getExtractionArgs = (
+  videoIdOrUrl: string,
+  {cookiesPath, playerClient, useJsRuntime = true}: {cookiesPath?: string; playerClient?: string; useJsRuntime?: boolean},
+) => {
+  const args = [
+    '--dump-single-json',
+    '--no-playlist',
+    '--skip-download',
+    '--no-warnings',
+    '--no-cache-dir',
+  ];
+
+  if (useJsRuntime) {
+    args.push('--js-runtimes', 'node');
+  }
+
+  if (playerClient) {
+    args.push('--extractor-args', `youtube:player_client=${playerClient}`);
+  }
+
+  args.push('-f', 'bestaudio/best', '-S', 'proto:https');
+
+  if (cookiesPath) {
+    args.push('--cookies', cookiesPath);
+  }
+
+  args.push(toYouTubeWatchUrl(videoIdOrUrl));
+
+  return args;
+};
 
 export const getYtDlpVersion = async (): Promise<string> => {
   const {stdout} = await execa(getExecutable(), ['--version'], {
@@ -294,32 +332,53 @@ export const updateYtDlp = async (): Promise<YtDlpUpdateResult> => {
   };
 };
 
-export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlpMediaSource> => {
+export const getYouTubeMediaSource = async (
+  videoIdOrUrl: string,
+  {playerClient: preferredPlayerClient}: {playerClient?: string} = {},
+): Promise<YtDlpMediaSource> => {
   try {
     return await withTemporaryCookies(async cookiesPath => {
-      const args = [
-        '--dump-single-json',
-        '--no-playlist',
-        '--skip-download',
-        '--no-warnings',
-        '--no-cache-dir',
-        '--js-runtimes',
-        'node',
-        '-f',
-        'bestaudio/best',
-        '-S',
-        'proto:https',
-      ];
+      const extractWithRuntime = (
+        useJsRuntime: boolean,
+        playerClient?: string,
+      ) => execa(
+        getExecutable(),
+        getExtractionArgs(videoIdOrUrl, {
+          cookiesPath: playerClient ? undefined : cookiesPath,
+          playerClient,
+          useJsRuntime,
+        }),
+        {timeout: YT_DLP_EXTRACT_TIMEOUT_MS},
+      );
 
-      if (cookiesPath) {
-        args.push('--cookies', cookiesPath);
+      const extract = async (playerClient?: string) => {
+        try {
+          return await extractWithRuntime(true, playerClient);
+        } catch (error: unknown) {
+          if (!isUnsupportedJsRuntimesOption(error)) {
+            throw error;
+          }
+
+          // Older yt-dlp versions cannot safely decipher current WEB URLs without
+          // a supported JS runtime, so use the Android API instead of WEB/no-JS.
+          return extractWithRuntime(false, playerClient ?? 'android');
+        }
+      };
+
+      let stdout = '';
+      for (let attempt = 1; attempt <= YT_DLP_EXTRACT_ATTEMPTS; attempt++) {
+        try {
+          const playerClient = preferredPlayerClient ?? (attempt === 1 ? undefined : 'android');
+          // A retry must start only after the previous extractor process exits.
+          // eslint-disable-next-line no-await-in-loop
+          ({stdout} = await extract(playerClient));
+          break;
+        } catch (error: unknown) {
+          if (!isTransientExtractionError(error) || attempt === YT_DLP_EXTRACT_ATTEMPTS) {
+            throw error;
+          }
+        }
       }
-
-      args.push(toYouTubeWatchUrl(videoIdOrUrl));
-
-      const {stdout} = await execa(getExecutable(), args, {
-        timeout: YT_DLP_EXTRACT_TIMEOUT_MS,
-      });
 
       const response = JSON.parse(stdout) as YtDlpResponse;
       const download = response.requested_downloads?.at(0) ?? response;

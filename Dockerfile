@@ -1,4 +1,7 @@
-FROM node:22-bookworm-slim AS base
+# YouTube live HLS manifests use a short rolling window. Debian Bookworm's
+# ffmpeg 5.1 can stop after the first window instead of following updates;
+# Trixie provides a newer ffmpeg with the required live-HLS fixes.
+FROM node:22-trixie-slim AS base
 
 ARG YT_DLP_VERSION=
 ENV MUSE_BUNDLED_YT_DLP_PATH=/opt/yt-dlp/bin/yt-dlp

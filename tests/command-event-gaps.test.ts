@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',

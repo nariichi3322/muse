@@ -32,7 +32,7 @@ vi.mock('execa', () => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -625,6 +625,22 @@ describe('PLAY-14 unplayable queue continuation preservation', () => {
     expect(player.getCurrent()).toBe(current);
     expect(player.getQueue().map(song => song.title)).toEqual(['Must remain upcoming']);
     expect(player.status).toBe(STATUS.PAUSED);
+  });
+});
+
+describe('PLAY-15 confirmed audio startup', () => {
+  it('registers errors before play and waits for the audio player to enter Playing', async () => {
+    const {player, voiceConnection} = makeReadyPlayer();
+    player.add(makeQueuedSong('Confirmed playback'));
+
+    await player.play();
+
+    const audioPlayer = getPrivatePlayer(player).audioPlayer!;
+    expect(audioPlayer.on).toHaveBeenCalledWith('error', expect.any(Function));
+    expect(audioPlayer.on.mock.invocationCallOrder.at(-1))
+      .toBeLessThan(audioPlayer.play.mock.invocationCallOrder[0]);
+    expect(dependencyMocks.entersState).toHaveBeenNthCalledWith(1, voiceConnection, 'ready', 60_000);
+    expect(dependencyMocks.entersState).toHaveBeenNthCalledWith(2, audioPlayer, 'playing', 15_000);
   });
 });
 

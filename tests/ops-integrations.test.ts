@@ -21,7 +21,7 @@ const dependencyMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -124,16 +124,26 @@ const flushAsyncWork = async () => {
   }
 };
 
-const makeFfmpegCommand = () => {
+const makeFfmpegCommand = ({error, output = true}: {error?: Error; output?: boolean} = {}) => {
+  const handlers = new Map<string, (...args: unknown[]) => void>();
   const command = {
     audioCodec: vi.fn(() => command),
     inputOptions: vi.fn(() => command),
     kill: vi.fn(),
     noVideo: vi.fn(() => command),
-    on: vi.fn(() => command),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      handlers.set(event, handler);
+      return command;
+    }),
     outputFormat: vi.fn(() => command),
-    pipe: vi.fn((destination: {end(): void}) => {
-      destination.end();
+    pipe: vi.fn((destination: {end(): void; write(chunk: Buffer): void}) => {
+      if (error) {
+        handlers.get('error')?.(error);
+      } else if (output) {
+        destination.write(Buffer.from('webm-opus-data'));
+        destination.end();
+      }
+
       return destination;
     }),
   };
@@ -414,6 +424,65 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
     });
   });
 
+  it('uses the Android client without the Node-runtime option for an older yt-dlp', async () => {
+    process.env.YT_DLP_PATH = '/fake/yt-dlp';
+    dependencyMocks.execa
+      .mockRejectedValueOnce({stderr: 'yt-dlp: error: no such option: --js-runtimes'})
+      .mockResolvedValueOnce({stdout: VALID_MEDIA_RESPONSE});
+
+    await expect(getYouTubeMediaSource('abcdefghijk')).resolves.toMatchObject({
+      url: 'https://media.example/requested.webm',
+      isLive: true,
+    });
+
+    expect(dependencyMocks.execa).toHaveBeenCalledTimes(2);
+    const firstArgs = dependencyMocks.execa.mock.calls[0][1] as string[];
+    const fallbackArgs = dependencyMocks.execa.mock.calls[1][1] as string[];
+    expect(firstArgs).toContain('--js-runtimes');
+    expect(fallbackArgs).not.toContain('--js-runtimes');
+    expect(fallbackArgs).toContain('--extractor-args');
+    expect(fallbackArgs).toContain('youtube:player_client=android');
+    expect(fallbackArgs.at(-1)).toBe('https://www.youtube.com/watch?v=abcdefghijk');
+  });
+
+  it('does not retry unrelated yt-dlp extraction failures', async () => {
+    dependencyMocks.execa.mockRejectedValue({stderr: 'ERROR: upstream TLS handshake failed'});
+
+    await expect(getYouTubeMediaSource('abcdefghijk'))
+      .rejects.toThrow('yt-dlp failed to extract media: ERROR: upstream TLS handshake failed');
+    expect(dependencyMocks.execa).toHaveBeenCalledOnce();
+  });
+
+  it('retries a transient YouTube page reload failure with a fresh extraction process', async () => {
+    dependencyMocks.execa
+      .mockRejectedValueOnce({stderr: 'ERROR: [youtube] abcdefghijk: The page needs to be reloaded.'})
+      .mockResolvedValueOnce({stdout: VALID_MEDIA_RESPONSE});
+
+    await expect(getYouTubeMediaSource('abcdefghijk')).resolves.toMatchObject({
+      url: 'https://media.example/requested.webm',
+    });
+
+    expect(dependencyMocks.execa).toHaveBeenCalledTimes(2);
+    const firstArgs = dependencyMocks.execa.mock.calls[0][1] as string[];
+    const fallbackArgs = dependencyMocks.execa.mock.calls[1][1] as string[];
+    expect(firstArgs).not.toContain('--extractor-args');
+    expect(fallbackArgs).toContain('--extractor-args');
+    expect(fallbackArgs).toContain('youtube:player_client=android');
+    expect(fallbackArgs.at(-1)).toBe(firstArgs.at(-1));
+  });
+
+  it('bounds repeated transient YouTube page reload failures', async () => {
+    dependencyMocks.execa.mockRejectedValue({
+      stderr: 'ERROR: [youtube] abcdefghijk: The page needs to be reloaded.',
+    });
+
+    await expect(getYouTubeMediaSource('abcdefghijk'))
+      .rejects.toThrow(
+        'yt-dlp failed to extract media: ERROR: [youtube] abcdefghijk: The page needs to be reloaded.',
+      );
+    expect(dependencyMocks.execa).toHaveBeenCalledTimes(3);
+  });
+
   it('hands reconnect and CRLF-normalized headers to ffmpeg', async () => {
     process.env.YT_DLP_PATH = '/fake/yt-dlp';
     const fileCache = {
@@ -456,6 +525,59 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
 
     stream.destroy();
     await flushAsyncWork();
+  });
+
+  it('re-extracts with the Android client when a WEB media URL returns HTTP 403', async () => {
+    const accessDenied = new Error('ffmpeg exited with code 8: Server returned 403 Forbidden (access denied)');
+    dependencyMocks.ffmpeg
+      .mockImplementationOnce(() => makeFfmpegCommand({error: accessDenied}))
+      .mockImplementationOnce(makeFfmpegCommand);
+    const fileCache = {
+      getPathFor: vi.fn().mockResolvedValue(null),
+    };
+    const player = new Player(fileCache as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Long uncached track',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 3_600,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+
+    expect(dependencyMocks.execa).toHaveBeenCalledTimes(2);
+    const initialArgs = dependencyMocks.execa.mock.calls[0][1] as string[];
+    const retryArgs = dependencyMocks.execa.mock.calls[1][1] as string[];
+    expect(initialArgs).not.toContain('--extractor-args');
+    expect(retryArgs).toContain('youtube:player_client=android');
+    expect(dependencyMocks.ffmpeg).toHaveBeenCalledTimes(2);
+
+    stream.destroy();
+    await flushAsyncWork();
+  });
+
+  it('rejects playback when ffmpeg fails before producing audio', async () => {
+    const ffmpegError = new Error('ffmpeg could not open media URL');
+    dependencyMocks.ffmpeg.mockImplementationOnce(() => makeFfmpegCommand({error: ffmpegError}));
+    const player = new Player({} as never, GUILD_ID);
+
+    const creatingStream = (player as unknown as {
+      createReadStream(options: {url: string; cacheKey: string}): Promise<Readable>;
+    }).createReadStream({
+      url: 'https://media.example/broken.webm',
+      cacheKey: 'abcdefghijk',
+    });
+
+    await expect(creatingStream).rejects.toBe(ffmpegError);
   });
 });
 
@@ -954,5 +1076,33 @@ describe('OPS-13 transient voice recovery', () => {
     );
     expect(connection.destroy).toHaveBeenCalledOnce();
     expect(player.voiceConnection).toBeNull();
+  });
+
+  it('recreates an initial voice connection that remains stuck before Ready', async () => {
+    const {connection: stuckConnection} = makeVoiceConnection({
+      state: {status: 'connecting'},
+    });
+    const {connection: readyConnection} = makeVoiceConnection({
+      state: {status: 'ready'},
+    });
+    dependencyMocks.joinVoiceChannel
+      .mockReturnValueOnce(stuckConnection)
+      .mockReturnValueOnce(readyConnection);
+    dependencyMocks.entersState
+      .mockRejectedValueOnce(new Error('initial Ready timeout'))
+      .mockResolvedValueOnce(undefined);
+    const player = new Player({} as never, GUILD_ID);
+    const channel = {
+      id: 'voice-channel-id',
+      guild: {id: GUILD_ID, voiceAdapterCreator: {}},
+    };
+
+    await expect(player.connect(channel as never)).resolves.toBeUndefined();
+
+    expect(dependencyMocks.joinVoiceChannel).toHaveBeenCalledTimes(2);
+    expect(dependencyMocks.sleep).toHaveBeenCalledWith(500);
+    expect(stuckConnection.destroy).toHaveBeenCalledOnce();
+    expect(readyConnection.destroy).not.toHaveBeenCalled();
+    expect(player.voiceConnection).toBe(readyConnection);
   });
 });

@@ -1,5 +1,6 @@
 import {VoiceChannel} from 'discord.js';
 import {Readable} from 'stream';
+import {setTimeout as sleep} from 'timers/promises';
 import hasha from 'hasha';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
@@ -37,6 +38,16 @@ import {Setting} from '@prisma/client';
 
 export {DEFAULT_VOLUME, MediaSource, STATUS};
 export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
+
+const MAX_INITIAL_VOICE_CONNECTION_ATTEMPTS = 2;
+const VOICE_CONNECTION_RETRY_DELAY_MS = 500;
+const FFMPEG_START_TIMEOUT_MS = 15_000;
+const AUDIO_PLAYER_START_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_MISSED_AUDIO_FRAMES = 50;
+const LIVE_MAX_MISSED_AUDIO_FRAMES = 500;
+
+const isFfmpegAccessDeniedError = (error: unknown) => error instanceof Error
+  && /\b403 Forbidden\b/i.test(error.message);
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
 
@@ -91,56 +102,78 @@ export default class {
     const settings = await getGuildSettings(this.guildId);
     const {defaultVolume = DEFAULT_VOLUME} = settings;
     this.defaultVolume = defaultVolume;
-
-    const voiceConnection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      selfDeaf: false,
-      adapterCreator: channel.guild.voiceAdapterCreator as DiscordGatewayAdapterCreator,
-    });
-
-    this.voiceConnection = voiceConnection;
     this.currentChannel = channel;
     this.hasRegisteredVoiceActivityListener = false;
-
-    voiceConnection.on('error', error => {
-      console.error(`Voice connection error for guild ${this.guildId}:`, error);
-    });
-
     const guildSettings = await getGuildSettings(this.guildId);
-    const stateTransitions = [voiceConnection.state.status];
-    voiceConnection.on('stateChange', (oldState, newState) => {
-      stateTransitions.push(newState.status);
-      if (stateTransitions.length > 10) {
-        stateTransitions.shift();
+
+    for (let attempt = 1; attempt <= MAX_INITIAL_VOICE_CONNECTION_ATTEMPTS; attempt++) {
+      const voiceConnection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        selfDeaf: false,
+        adapterCreator: channel.guild.voiceAdapterCreator as DiscordGatewayAdapterCreator,
+      });
+
+      this.voiceConnection = voiceConnection;
+      const stateTransitions = [voiceConnection.state.status];
+
+      voiceConnection.on('error', error => {
+        console.error(`Voice connection error for guild ${this.guildId}:`, error);
+      });
+
+      voiceConnection.on('stateChange', (oldState, newState) => {
+        stateTransitions.push(newState.status);
+        if (stateTransitions.length > 10) {
+          stateTransitions.shift();
+        }
+
+        debug(`Voice connection state changed: ${oldState.status} -> ${newState.status}`);
+
+        if (this.voiceConnection === voiceConnection
+          && newState.status === VoiceConnectionStatus.Ready
+          && !this.hasRegisteredVoiceActivityListener) {
+          this.registerVoiceActivityListener(guildSettings);
+          this.hasRegisteredVoiceActivityListener = true;
+        }
+      });
+
+      voiceConnection.on(
+        VoiceConnectionStatus.Disconnected,
+        this.onVoiceConnectionDisconnect.bind(this, voiceConnection),
+      );
+
+      try {
+        // Voice connection attempts must run sequentially.
+        // eslint-disable-next-line no-await-in-loop
+        await this.waitForVoiceConnectionReady(voiceConnection);
+        return;
+      } catch {
+        const {status} = voiceConnection.state;
+        const isCurrentConnection = this.voiceConnection === voiceConnection;
+        const shouldRetry = isCurrentConnection
+          && attempt < MAX_INITIAL_VOICE_CONNECTION_ATTEMPTS
+          && voiceConnection.rejoinAttempts === 0
+          && [VoiceConnectionStatus.Connecting, VoiceConnectionStatus.Signalling].includes(status);
+
+        destroyVoiceConnection(voiceConnection);
+
+        if (isCurrentConnection) {
+          this.voiceConnection = null;
+        }
+
+        if (!shouldRetry) {
+          throw new Error(`Failed to connect to the voice channel (last state: ${status}, rejoin attempts: ${voiceConnection.rejoinAttempts}, recent states: ${stateTransitions.join(' -> ')}).`);
+        }
+
+        debug(`Retrying initial voice connection for guild ${this.guildId} after attempt ${attempt}.`);
+        // Leave time for Discord to process the destroyed voice session before rejoining.
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(VOICE_CONNECTION_RETRY_DELAY_MS);
+
+        if (this.voiceConnection !== null) {
+          throw new Error(`Failed to connect to the voice channel (last state: ${status}, rejoin attempts: ${voiceConnection.rejoinAttempts}, recent states: ${stateTransitions.join(' -> ')}).`);
+        }
       }
-
-      debug(`Voice connection state changed: ${oldState.status} -> ${newState.status}`);
-
-      if (this.voiceConnection === voiceConnection
-        && newState.status === VoiceConnectionStatus.Ready
-        && !this.hasRegisteredVoiceActivityListener) {
-        this.registerVoiceActivityListener(guildSettings);
-        this.hasRegisteredVoiceActivityListener = true;
-      }
-    });
-
-    voiceConnection.on(
-      VoiceConnectionStatus.Disconnected,
-      this.onVoiceConnectionDisconnect.bind(this, voiceConnection),
-    );
-
-    try {
-      await this.waitForVoiceConnectionReady(voiceConnection);
-    } catch {
-      const {status} = voiceConnection.state;
-      destroyVoiceConnection(voiceConnection);
-
-      if (this.voiceConnection === voiceConnection) {
-        this.voiceConnection = null;
-      }
-
-      throw new Error(`Failed to connect to the voice channel (last state: ${status}, rejoin attempts: ${voiceConnection.rejoinAttempts}, recent states: ${stateTransitions.join(' -> ')}).`);
     }
   }
 
@@ -492,15 +525,11 @@ export default class {
       return;
     }
 
-    this.audioPlayer = createAudioPlayer({
-      behaviors: {
-        // Needs to be somewhat high for livestreams
-        maxMissedFrames: 50,
-      },
-    });
+    this.audioPlayer = this.createPlaybackAudioPlayer(currentSong);
     voiceConnection.subscribe(this.audioPlayer);
-    this.playAudioPlayerResource(this.createAudioStream(stream));
     this.attachListeners();
+    this.playAudioPlayerResource(this.createAudioStream(stream));
+    await this.waitForAudioPlayerPlaying(this.audioPlayer);
     this.startTrackingPosition(positionSeconds);
 
     this.status = STATUS.PLAYING;
@@ -546,7 +575,9 @@ export default class {
       && currentSong === this.nowPlaying
       && this.currentQueueEntryVersion === this.nowPlayingQueueEntryVersion) {
       if (this.audioPlayer) {
-        this.audioPlayer.unpause();
+        const {audioPlayer} = this;
+        audioPlayer.unpause();
+        await this.waitForAudioPlayerPlaying(audioPlayer);
         this.status = STATUS.PLAYING;
         this.startTrackingPosition();
         return;
@@ -572,16 +603,11 @@ export default class {
         return;
       }
 
-      this.audioPlayer = createAudioPlayer({
-        behaviors: {
-          // Needs to be somewhat high for livestreams
-          maxMissedFrames: 50,
-        },
-      });
+      this.audioPlayer = this.createPlaybackAudioPlayer(currentSong);
       voiceConnection.subscribe(this.audioPlayer);
-      this.playAudioPlayerResource(this.createAudioStream(stream));
-
       this.attachListeners();
+      this.playAudioPlayerResource(this.createAudioStream(stream));
+      await this.waitForAudioPlayerPlaying(this.audioPlayer);
 
       this.status = STATUS.PLAYING;
       this.nowPlaying = currentSong;
@@ -648,49 +674,63 @@ export default class {
       return this.createReadStream({url: song.url, cacheKey: song.url});
     }
 
-    let ffmpegInput: string | null;
-    const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
+    const addPlaybackRangeOptions = (inputOptions: string[]) => {
+      if (options.seek) {
+        inputOptions.push('-ss', options.seek.toString());
+      }
 
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+      if (options.to) {
+        inputOptions.push('-to', options.to.toString());
+      }
+    };
 
-    if (!ffmpegInput) {
-      const mediaSource = await getYouTubeMediaSource(song.url);
-      ffmpegInput = mediaSource.url;
+    const cachedInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+    if (cachedInput) {
+      const inputOptions: string[] = [];
+      addPlaybackRangeOptions(inputOptions);
+      return this.createReadStream({
+        url: cachedInput,
+        cacheKey: song.url,
+        ffmpegInputOptions: inputOptions,
+      });
+    }
 
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
+    const createYouTubeStream = async (playerClient?: string) => {
+      const mediaSource = await getYouTubeMediaSource(song.url, {playerClient});
+      const inputOptions = [
         '-reconnect',
         '1',
         '-reconnect_streamed',
         '1',
         '-reconnect_delay_max',
         '5',
-      ]);
+        ...this.buildFfmpegHeaderOptions(mediaSource.headers),
+      ];
+      addPlaybackRangeOptions(inputOptions);
 
-      const headerOptions = this.buildFfmpegHeaderOptions(mediaSource.headers);
-      ffmpegInputOptions.push(...headerOptions);
+      // Don't cache livestreams or long videos
+      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+      const shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+      return this.createReadStream({
+        url: mediaSource.url,
+        cacheKey: song.url,
+        ffmpegInputOptions: inputOptions,
+        cache: shouldCacheVideo,
+      });
+    };
+
+    try {
+      return await createYouTubeStream();
+    } catch (error: unknown) {
+      if (!isFfmpegAccessDeniedError(error)) {
+        throw error;
+      }
+
+      debug(`Retrying YouTube media for guild ${this.guildId} with the Android client after ffmpeg HTTP 403.`);
+      return createYouTubeStream('android');
     }
-
-    if (options.seek) {
-      ffmpegInputOptions.push('-ss', options.seek.toString());
-    }
-
-    if (options.to) {
-      ffmpegInputOptions.push('-to', options.to.toString());
-    }
-
-    return this.createReadStream({
-      url: ffmpegInput,
-      cacheKey: song.url,
-      ffmpegInputOptions,
-      cache: shouldCacheVideo,
-    });
   }
 
   private startTrackingPosition(initalPosition?: number): void {
@@ -738,6 +778,14 @@ export default class {
         });
       });
     }
+
+    if (audioPlayer.listeners('error').length === 0) {
+      audioPlayer.on('error', error => {
+        if (this.audioPlayer === audioPlayer) {
+          console.error(`Audio player failed for guild ${this.guildId}:`, error);
+        }
+      });
+    }
   }
 
   private async onVoiceConnectionDisconnect(voiceConnection: VoiceConnection): Promise<void> {
@@ -765,6 +813,10 @@ export default class {
 
   private async waitForVoiceConnectionReady(voiceConnection: VoiceConnection): Promise<void> {
     await entersState(voiceConnection, VoiceConnectionStatus.Ready, 60_000);
+  }
+
+  private async waitForAudioPlayerPlaying(audioPlayer: AudioPlayer): Promise<void> {
+    await entersState(audioPlayer, AudioPlayerStatus.Playing, AUDIO_PLAYER_START_TIMEOUT_MS);
   }
 
   private async advancePastUnplayableTrack(): Promise<void> {
@@ -921,6 +973,7 @@ export default class {
 
       const returnedStream = capacitor.createReadStream();
       let hasReturnedStreamClosed = false;
+      let hasProducedAudio = false;
 
       const stream = ffmpeg(options.url)
         .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
@@ -928,13 +981,44 @@ export default class {
         .audioCodec('libopus')
         .outputFormat('webm')
         .on('error', error => {
-          if (!hasReturnedStreamClosed) {
+          if (!hasProducedAudio) {
+            clearTimeout(startupTimeout);
             reject(error);
+            returnedStream.destroy();
+          } else if (!hasReturnedStreamClosed) {
+            returnedStream.destroy(error);
           }
         })
         .on('start', command => {
           debug(`Spawned ffmpeg with ${command}`);
         });
+
+      const startupTimeout = setTimeout(() => {
+        if (!hasProducedAudio) {
+          stream.kill('SIGKILL');
+          returnedStream.destroy();
+          reject(new Error(`ffmpeg did not produce audio within ${FFMPEG_START_TIMEOUT_MS / 1000} seconds.`));
+        }
+      }, FFMPEG_START_TIMEOUT_MS);
+
+      returnedStream.once('readable', () => {
+        if (returnedStream.readableLength > 0) {
+          hasProducedAudio = true;
+          clearTimeout(startupTimeout);
+          resolve(returnedStream);
+        }
+      });
+
+      returnedStream.once('end', () => {
+        if (!hasProducedAudio) {
+          clearTimeout(startupTimeout);
+          reject(new Error('ffmpeg ended before producing audio.'));
+        }
+      });
+
+      returnedStream.on('error', error => {
+        console.error(`FFmpeg output stream failed for guild ${this.guildId}:`, error);
+      });
 
       stream.pipe(capacitor);
 
@@ -945,8 +1029,6 @@ export default class {
 
         hasReturnedStreamClosed = true;
       });
-
-      resolve(returnedStream);
     });
   }
 
@@ -954,6 +1036,18 @@ export default class {
     return createAudioResource(stream, {
       inputType: StreamType.WebmOpus,
       inlineVolume: true,
+    });
+  }
+
+  private createPlaybackAudioPlayer(song: QueuedSong) {
+    return createAudioPlayer({
+      behaviors: {
+        // Audio frames are 20 ms. Live HLS segment changes can briefly starve
+        // the demuxer, so keep sending silence while the next segment arrives.
+        maxMissedFrames: song.isLive
+          ? LIVE_MAX_MISSED_AUDIO_FRAMES
+          : DEFAULT_MAX_MISSED_AUDIO_FRAMES,
+      },
     });
   }
 

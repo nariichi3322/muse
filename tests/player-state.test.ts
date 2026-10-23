@@ -10,7 +10,7 @@ const dependencyMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@discordjs/voice', () => ({
-  AudioPlayerStatus: {Idle: 'idle'},
+  AudioPlayerStatus: {Idle: 'idle', Playing: 'playing'},
   VoiceConnectionDisconnectReason: {WebSocketClose: 'websocket-close'},
   VoiceConnectionStatus: {
     Connecting: 'connecting',
@@ -460,6 +460,30 @@ describe('Player same-URL entry identity', () => {
     expect(firstAudioPlayer.unpause).not.toHaveBeenCalled();
     expect(dependencyMocks.createAudioPlayer).toHaveBeenCalledTimes(2);
     expect(getStream).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Player live-stream buffering', () => {
+  it('allows a longer packet gap for live HLS segment changes', async () => {
+    const {player} = makeReadyPlayer();
+    player.add(makeSong('Live stream', {isLive: true}));
+
+    await player.play();
+
+    expect(dependencyMocks.createAudioPlayer).toHaveBeenCalledWith({
+      behaviors: {maxMissedFrames: 500},
+    });
+  });
+
+  it('keeps the shorter missed-frame limit for regular videos', async () => {
+    const {player} = makeReadyPlayer();
+    player.add(makeSong('Regular video'));
+
+    await player.play();
+
+    expect(dependencyMocks.createAudioPlayer).toHaveBeenCalledWith({
+      behaviors: {maxMissedFrames: 50},
+    });
   });
 });
 
